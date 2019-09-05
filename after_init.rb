@@ -1,0 +1,6 @@
+require_dependency 'redmine_openid_connect'
+
+Rails.configuration.to_prepare do
+	ApplicationController.prepend(RedmineOpenidConnect::ApplicationControllerPatch)
+	AccountController.prepend(RedmineOpenidConnect::AccountControllerPatch)
+end
