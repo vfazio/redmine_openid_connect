@@ -37,8 +37,9 @@ module RedmineOpenidConnect
         end
 
         if oic_session.complete? && oic_session.expired?
-          response = oic_session.refresh_access_token!
-          if response[:error].present?
+          begin
+            response = oic_session.refresh_access_token!
+          rescue => e
             oic_session.destroy
             oic_session = OicSession.create
             session[:oic_session_id] = oic_session.id

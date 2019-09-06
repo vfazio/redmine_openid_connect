@@ -28,60 +28,82 @@ class OicSession < ActiveRecord::Base
     !self.enabled?
   end
 
-  def self.openid_configuration_url
-    client_config['openid_connect_server_url'] + '/.well-known/openid-configuration'
-  end
-
   def self.get_dynamic_config
     hash = Digest::SHA1.hexdigest client_config.to_json
     expiry = client_config['dynamic_config_expiry'] || 86400
     Rails.cache.fetch("oic_session_dynamic_#{hash}", expires_in: expiry) do
-      HTTParty::Basement.default_options.update(verify: false) if client_config['disable_ssl_validation']
-      ActiveSupport::HashWithIndifferentAccess.new HTTParty.get(openid_configuration_url)
+      OpenIDConnect::Discovery::Provider::Config.discover!(
+        client_config['openid_connect_server_url']
+      )
     end
   end
 
   def self.dynamic_config
-    @dynamic_config ||= get_dynamic_config
+    @dynamic_config = get_dynamic_config
   end
 
   def dynamic_config
     self.class.dynamic_config
   end
 
-  def self.get_token(query)
-    uri = dynamic_config['token_endpoint']
+  def self.client
+    return @client if @client
 
-    HTTParty::Basement.default_options.update(verify: false) if client_config['disable_ssl_validation']
-    response = HTTParty.post(
-      uri,
-      body: query,
-      basic_auth: {username: client_config['client_id'], password: client_config['client_secret'] }
+    if client_config['disable_ssl_validation']
+      OpenIDConnect.http_config do |config|
+        config.ssl_config.verify_mode = 0
+      end
+    end
+
+    @client = OpenIDConnect::Client.new(
+      identifier: client_config['client_id'],
+      secret: client_config['client_secret'],
+      redirect_uri: "#{host_name}/oic/local_login",
+      authorization_endpoint: dynamic_config.authorization_endpoint,
+      token_endpoint: dynamic_config.token_endpoint,
+      userinfo_endpoint: dynamic_config.userinfo_endpoint,
+      jwks_uri: dynamic_config.jwks_uri,
+      end_session_endpoint: dynamic_config.end_session_endpoint,
     )
   end
 
+  def client
+    self.class.client
+  end
+
+  def self.get_token()
+    token = client.access_token!(
+      scope: scopes,
+      client_auth_method: :basic,
+    )
+  end
+
+  def get_token()
+    self.current_access_token = self.class.get_token()
+    self.access_token = current_access_token.access_token if current_access_token.access_token.present?
+    self.refresh_token = current_access_token.refresh_token if current_access_token.refresh_token.present?
+    self.id_token = current_access_token.id_token if current_access_token.id_token.present?
+    self.expires_at = (DateTime.now + current_access_token.expires_in.seconds) if current_access_token.expires_in.present?
+    self.save!
+    return self.current_access_token
+  end
+
+  def current_access_token=(token)
+    @current_access_token = token
+  end
+
+  def current_access_token
+    @current_access_token
+  end
+
   def get_access_token!
-    response = self.class.get_token(access_token_query)
-    if response["error"].blank?
-      self.access_token = response["access_token"] if response["access_token"].present?
-      self.refresh_token = response["refresh_token"] if response["refresh_token"].present?
-      self.id_token = response["id_token"] if response["id_token"].present?
-      self.expires_at = (DateTime.now + response["expires_in"].seconds) if response["expires_in"].present?
-      self.save!
-    end
-    return response
+    client.authorization_code = code
+    response = get_token()
   end
 
   def refresh_access_token!
-    response = self.class.get_token(refresh_token_query)
-    if response["error"].blank?
-      self.access_token = response["access_token"] if response["access_token"].present?
-      self.refresh_token = response["refresh_token"] if response["refresh_token"].present?
-      self.id_token = response["id_token"] if response["id_token"].present?
-      self.expires_at = (DateTime.now + response["expires_in"].seconds) if response["expires_in"].present?
-      self.save!
-    end
-    return response
+    client.refresh_token = refresh_token
+    response = get_token()
   end
 
   def self.parse_token(token)
@@ -97,22 +119,8 @@ class OicSession < ActiveRecord::Base
   end
 
   def get_user_info!
-    uri = dynamic_config['userinfo_endpoint']
-
-    HTTParty::Basement.default_options.update(verify: false) if client_config['disable_ssl_validation']
-    response = HTTParty.get(
-      uri,
-      headers: { "Authorization" => "Bearer #{access_token}" }
-    )
-
-    if response.headers["content-type"] == 'application/jwt'
-      # signed / encrypted response, extract before using
-      return self.class.parse_token(response)
-    else
-      # unsigned response, just return the bare json
-      return JSON::parse(response.body)
-      decoded_token = response.body
-    end
+    user_info = current_access_token.userinfo!
+    user_info.raw_attributes
   end
 
   def authorized?
@@ -149,14 +157,19 @@ class OicSession < ActiveRecord::Base
   end
 
   def authorization_url
-    config = dynamic_config
-    config["authorization_endpoint"] + "?" + authorization_query.to_param
+    client.authorization_uri(
+      {
+        response_type: :code,
+        scope: scopes,
+        state: self.state,
+        nonce: self.nonce,
+      }
+    )
   end
 
   def end_session_url
-    config = dynamic_config
-    return if config["end_session_endpoint"].nil?
-    config["end_session_endpoint"] + "?" + end_session_query.to_param
+    return if dynamic_config.end_session_endpoint.nil?
+    dynamic_config.end_session_endpoint + "?" + end_session_query.to_param
   end
 
   def randomize_state!
@@ -165,35 +178,6 @@ class OicSession < ActiveRecord::Base
 
   def randomize_nonce!
     self.nonce = SecureRandom.uuid unless self.nonce.present?
-  end
-
-  def authorization_query
-    query = {
-      "response_type" => "code",
-      "state" => self.state,
-      "nonce" => self.nonce,
-      "scope" => scopes,
-      "redirect_uri" => "#{host_name}/oic/local_login",
-      "client_id" => client_config['client_id'],
-    }
-  end
-
-  def access_token_query
-    query = {
-      'grant_type' => 'authorization_code',
-      'code' => code,
-      'scope' => scopes,
-      'id_token' => id_token,
-      'redirect_uri' => "#{host_name}/oic/local_login",
-    }
-  end
-
-  def refresh_token_query
-    query = {
-      'grant_type' => 'refresh_token',
-      'refresh_token' => refresh_token,
-      'scope' => scopes,
-    }
   end
 
   def end_session_query
@@ -208,15 +192,15 @@ class OicSession < ActiveRecord::Base
     self.expires_at.nil? ? false : (self.expires_at < DateTime.now)
   end
 
-  def incomplete?
-    self.access_token.blank?
-  end
-
   def complete?
     self.access_token.present?
   end
 
   def scopes
+    self.class.scopes
+  end
+
+  def self.scopes
     if client_config["scopes"].nil?
       return "openid profile email"
     else
