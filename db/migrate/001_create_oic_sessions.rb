@@ -1,4 +1,4 @@
-class CreateOicSessions < ActiveRecord::Migration[4.2]
+class CreateOicSessions < ActiveRecord::Migration
   def self.up
     create_table :oic_sessions do |t|
       t.references :user, foreign_key: true
