@@ -1,4 +1,4 @@
-class CascadeDeleteSessions < ActiveRecord::Migration
+class CascadeDeleteSessions < ActiveRecord::Migration[4.2]
 	def up
 	  change_table :oic_sessions do |t|
 		t.remove_references :user, foreign_key: true
